@@ -126,56 +126,13 @@ const cdf = z => {
   return z>0?1-p:p;
 };
 
-/* NATIVE JSONP WITH PROXY FALLBACK */
-let jsonpCounter = 0;
-function jsonp(url) {
-  return new Promise((resolve, reject) => {
-    const cbName = 'espn_jsonp_cb_' + (++jsonpCounter);
-    const script = document.createElement('script');
-    const sep = url.includes('?') ? '&' : '?';
-    script.src = `${url}${sep}callback=${cbName}`;
-
-    const timer = setTimeout(() => {
-      cleanup();
-      reject(new Error('JSONP request timeout'));
-    }, 8000);
-
-    function cleanup() {
-      clearTimeout(timer);
-      if (script.parentNode) script.parentNode.removeChild(script);
-      delete window[cbName];
-    }
-
-    window[cbName] = function(data) {
-      cleanup();
-      resolve(data);
-    };
-
-    script.onerror = function() {
-      cleanup();
-      reject(new Error('JSONP script load error'));
-    };
-
-    document.head.appendChild(script);
-  });
-}
-
+/* ROBUST MULTI-PROXY FETCH PIPELINE */
 async function getJSON(url) {
-  // 1. Try Native JSONP first (Bypasses GitHub Pages CORS)
-  try {
-    return await jsonp(url);
-  } catch(e) {}
-
-  // 2. Direct fetch attempt
-  try {
-    let r = await fetch(url);
-    if(r.ok) return await r.json();
-  } catch(e) {}
-
-  // 3. Fallback proxies if JSONP and direct fetch fail
   const proxies = [
+    u => u, // Direct fetch first
     u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
-    u => `https://corsproxy.io/?${encodeURIComponent(u)}`
+    u => `https://corsproxy.io/?${encodeURIComponent(u)}`,
+    u => `https://thingproxy.freeboard.io/fetch/${u}`
   ];
   
   for(let p of proxies){
@@ -186,7 +143,7 @@ async function getJSON(url) {
         let json = await r.json();
         if(json) return json;
       }
-    } catch(e) {}
+    } catch(e) { continue; }
   }
   throw new Error('Network query blocked across all endpoints');
 }
