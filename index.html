@@ -126,10 +126,54 @@ const cdf = z => {
   return z>0?1-p:p;
 };
 
-/* CORSPROXY HELPER TO BYPASS ESPN CORS BLOCKS ON GITHUB PAGES */
-async function getJSON(url){
+/* NATIVE JSONP WITH PROXY FALLBACK */
+let jsonpCounter = 0;
+function jsonp(url) {
+  return new Promise((resolve, reject) => {
+    const cbName = 'espn_jsonp_cb_' + (++jsonpCounter);
+    const script = document.createElement('script');
+    const sep = url.includes('?') ? '&' : '?';
+    script.src = `${url}${sep}callback=${cbName}`;
+
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error('JSONP request timeout'));
+    }, 8000);
+
+    function cleanup() {
+      clearTimeout(timer);
+      if (script.parentNode) script.parentNode.removeChild(script);
+      delete window[cbName];
+    }
+
+    window[cbName] = function(data) {
+      cleanup();
+      resolve(data);
+    };
+
+    script.onerror = function() {
+      cleanup();
+      reject(new Error('JSONP script load error'));
+    };
+
+    document.head.appendChild(script);
+  });
+}
+
+async function getJSON(url) {
+  // 1. Try Native JSONP first (Bypasses GitHub Pages CORS)
+  try {
+    return await jsonp(url);
+  } catch(e) {}
+
+  // 2. Direct fetch attempt
+  try {
+    let r = await fetch(url);
+    if(r.ok) return await r.json();
+  } catch(e) {}
+
+  // 3. Fallback proxies if JSONP and direct fetch fail
   const proxies = [
-    u => u, // Direct fetch first
     u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
     u => `https://corsproxy.io/?${encodeURIComponent(u)}`
   ];
@@ -142,9 +186,9 @@ async function getJSON(url){
         let json = await r.json();
         if(json) return json;
       }
-    } catch(e) { /* continue to next proxy */ }
+    } catch(e) {}
   }
-  throw new Error('Network query blocked across all proxy endpoints');
+  throw new Error('Network query blocked across all endpoints');
 }
 
 function saveInputs(){
@@ -335,11 +379,11 @@ function gameHTML(g){
   const sc = g.score?` <small>${g.score.away}-${g.score.home}</small>`:'';
   const lean = m? (m.margin>=0?g.home:g.away) : null;
   const nOut = [g.away,g.home].reduce((n,t)=>n+(S.injuries[t]||[]).filter(i=>isOut(i.status)).length,0);
-  const leanTxt = (m? `<span class="pick">${lean}</span>${(Math.max(m.pHome,1-m.pHome)*100).toFixed(0)}%` : '') + (nOut?`<br><span class="fade">🩹 ${nOut} out/doubtful</span>`:'');
+  const leanTxt = (m? `<span class="pick">${lean}</span> ${(Math.max(m.pHome,1-m.pHome)*100).toFixed(0)}%` : '') + (nOut?`<br><span class="fade">🩹 ${nOut} out/doubtful</span>`:'');
   return `<div class="game" data-id="${g.id}">
     <div class="ghead">
       <div><div class="teams">${g.away}<small>@</small>${g.home}${sc}${status}</div>
-      <div class="sub">${NAMES[g.away]||g.away} at${NAMES[g.home]||g.home}</div></div>
+      <div class="sub">${NAMES[g.away]||g.away} at ${NAMES[g.home]||g.home}</div></div>
       <div class="time">${timeStr(g.time)}<br>${leanTxt}</div>
     </div>
     <div class="body" id="body-${g.id}"></div>
@@ -426,6 +470,122 @@ function statCell(p,stat,pr,k,out){
 }
 
 function playerRow(r,t,opp,g){
-  const inj=(S.injuries[t]||[]).find(x=>x.id==r.id||x.name===r.name), out=inj&&isOut(inj.status);
-  const badge=inj?` <span class="badge" style="color:var(--${out?'red':'amber'})">${inj.status}</span>`:'';
-  const head=`<td>${r.
+  const p = S.athletes[r.id];
+  if(!p || !p.gp) return '';
+  const pr = playerProj(p, opp);
+  const inj = (S.injuries[t]||[]).find(x=>x.id==r.id||x.name===r.name);
+  const out = inj && isOut(inj.status);
+  const badge = inj?` <span class="badge ${injCls(inj.status)}">${inj.status}</span>`:'';
+  const k = `${g.id}-${r.id}`;
+  return `<tr>
+    <td><b>${r.name}</b> <span class="sub">${r.pos||''} · ${t}</span>${badge}</td>
+    <td class="n">${p.gp}</td>
+    <td class="n">${fmt1(p.min)}</td>
+    ${statCell(p,'pts',pr,k,out)}
+    ${statCell(p,'reb',pr,k,out)}
+    ${statCell(p,'ast',pr,k,out)}
+  </tr>`;
+}
+
+async function loadPlayers(g){
+  const injEl = $('#inj-'+g.id);
+  const injA = S.injuries[g.away]||[], injH = S.injuries[g.home]||[];
+  if(!injA.length && !injH.length) injEl.innerHTML = '<div class="sub">No injuries reported.</div>';
+  else {
+    const renderInj = (t, list) => `<b>${t}:</b> ` + (list.length ? list.map(i=>`${i.name} (<span class="${injCls(i.status)}">${i.status}</span>${i.note?': '+i.note:''})`).join('; ') : 'Clean slate');
+    injEl.innerHTML = `<div class="sub">${renderInj(g.away, injA)}<br>${renderInj(g.home, injH)}</div>`;
+  }
+
+  const plEl = $('#pl-'+g.id);
+  try {
+    const [rosA, rosH] = await Promise.all([loadRoster(g.away), loadRoster(g.home)]);
+    if(!S.athletes) await loadAthletes();
+    const rowsA = rosA.map(r=>playerRow(r, g.away, g.home, g)).join('');
+    const rowsH = rosH.map(r=>playerRow(r, g.home, g.away, g)).join('');
+    if(!rowsA && !rowsH) plEl.innerHTML = '<div class="sub">No player stat averages available.</div>';
+    else {
+      plEl.innerHTML = `<table>
+        <thead><tr><th>Player</th><th class="n">GP</th><th class="n">MIN</th><th>Points</th><th>Rebounds</th><th>Assists</th></tr></thead>
+        <tbody>${rowsA}${rowsH}</tbody>
+      </table>`;
+    }
+  } catch(e) { plEl.innerHTML = '<div class="sub">Failed loading player stats.</div>'; }
+  restoreInputs();
+}
+
+function upd(id){
+  const g = S.games.find(x=>x.id==id); if(!g) return;
+  const m = gameModel(g); if(!m) return;
+  const fav = m.margin>=0?g.home:g.away;
+  const pFav = Math.max(m.pHome, 1-m.pHome);
+
+  const mlIn = $('#ml-'+id), mlR = $('#mlr-'+id);
+  if(mlIn && mlR && mlIn.value){
+    const o = parseFloat(mlIn.value);
+    if(o > 0){
+      const fair = 1/pFav;
+      const ev = (pFav * o) - 1;
+      mlR.innerHTML = ev > 0 
+        ? `<span class="pick">Value (+${(ev*100).toFixed(1)}% EV)</span> Fair: ${fair.toFixed(2)}`
+        : `<span class="fade">No Value (${(ev*100).toFixed(1)}% EV)</span> Fair: ${fair.toFixed(2)}`;
+    }
+  }
+
+  const spIn = $('#sp-'+id), spR = $('#spr-'+id);
+  if(spIn && spR && spIn.value){
+    const line = parseFloat(spIn.value);
+    const modelLine = -Math.abs(m.margin);
+    const diff = modelLine - line; 
+    if(Math.abs(diff) >= EDGE_SPREAD){
+      spR.innerHTML = diff < 0 
+        ? `<span class="pick">Lean ${fav} ${line}</span> (Model: ${modelLine.toFixed(1)})`
+        : `<span class="fade">Fade ${fav} ${line}</span> (Model: ${modelLine.toFixed(1)})`;
+    } else spR.innerHTML = `<span class="neutral">Fair line</span> (Model: ${modelLine.toFixed(1)})`;
+  }
+
+  const totIn = $('#tot-'+id), totR = $('#totr-'+id);
+  if(totIn && totR && totIn.value){
+    const line = parseFloat(totIn.value);
+    const diff = m.total - line;
+    if(Math.abs(diff) >= 3){
+      totR.innerHTML = diff > 0 
+        ? `<span class="pick">Lean OVER</span> (Model: ${m.total.toFixed(1)})`
+        : `<span class="pick">Lean UNDER</span> (Model: ${m.total.toFixed(1)})`;
+    } else totR.innerHTML = `<span class="neutral">Fair line</span> (Model: ${m.total.toFixed(1)})`;
+  }
+}
+
+function prop(k, stat){
+  const inp = $(`#ln-${k}-${stat}`), res = $(`#lr-${k}-${stat}`);
+  if(!inp || !res || !inp.value) return;
+  const line = parseFloat(inp.value), proj = parseFloat(inp.dataset.proj);
+  const th = thr(proj, stat);
+  if(line <= proj - th) res.innerHTML = `<span class="pick">OVER edge</span>`;
+  else if(line >= proj + th) res.innerHTML = `<span class="fade">UNDER edge</span>`;
+  else res.innerHTML = `<span class="neutral">No edge</span>`;
+}
+
+async function fetchData(){
+  const statusEl = $('#status-text');
+  statusEl.textContent = 'Updating schedule & teams…';
+  saveInputs();
+  try {
+    const [games] = await Promise.all([loadSchedule(), loadTeamStats(), loadInjuries()]);
+    S.games = games;
+    S.lastUpdate = new Date();
+    statusEl.textContent = `Updated: ${S.lastUpdate.toLocaleTimeString('en-GB', {hour:'2-digit',minute:'2-digit'})} UK`;
+    $('#status').className = 'status ok';
+  } catch(e) {
+    console.warn('API fetch failed, falling back', e);
+    S.games = FALLBACK;
+    statusEl.textContent = 'Using Fallback Schedule (API Offline)';
+    $('#status').className = 'status warn';
+  }
+  render();
+}
+
+fetchData();
+setInterval(fetchData, AUTO_REFRESH_INTERVAL);
+</script>
+</body>
+</html>
